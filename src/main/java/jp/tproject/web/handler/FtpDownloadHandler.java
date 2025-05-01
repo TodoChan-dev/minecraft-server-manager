@@ -19,12 +19,14 @@ import java.util.Map;
 
 /**
  * FTPファイルダウンロードを処理するハンドラ
+ * 複数サーバー対応
  */
 public class FtpDownloadHandler implements HttpHandler {
 
     private static final Logger logger = LoggerFactory.getLogger(FtpDownloadHandler.class);
     private final FtpManager ftpManager;
     private final NotificationServer notificationServer;
+    private final String serverId;
 
     // 一時ファイル保存用ディレクトリ
     private static final String TEMP_DIR = System.getProperty("java.io.tmpdir");
@@ -34,10 +36,12 @@ public class FtpDownloadHandler implements HttpHandler {
      *
      * @param ftpManager FTPマネージャー
      * @param notificationServer 通知サーバー
+     * @param serverId サーバーID
      */
-    public FtpDownloadHandler(FtpManager ftpManager, NotificationServer notificationServer) {
+    public FtpDownloadHandler(FtpManager ftpManager, NotificationServer notificationServer, String serverId) {
         this.ftpManager = ftpManager;
         this.notificationServer = notificationServer;
+        this.serverId = serverId;
     }
 
     @Override
@@ -59,7 +63,14 @@ public class FtpDownloadHandler implements HttpHandler {
 
         // パスを取得
         String requestPath = exchange.getRequestURI().getPath();
-        String filePath = requestPath.replaceFirst("^/ftp/download/?", "");
+
+        // サーバーID付きパス (/ftp/{serverId}/download/...)とデフォルトパス(/ftp/download/...)の両方に対応
+        String filePath;
+        if (requestPath.startsWith("/ftp/" + serverId + "/download/")) {
+            filePath = requestPath.replaceFirst("^/ftp/" + serverId + "/download/?", "");
+        } else {
+            filePath = requestPath.replaceFirst("^/ftp/download/?", "");
+        }
 
         if (filePath.isEmpty()) {
             sendBadRequest(exchange, "ファイルパスが指定されていません");
@@ -79,10 +90,10 @@ public class FtpDownloadHandler implements HttpHandler {
                 boolean success = ftpManager.downloadFile(filePath, fos);
 
                 if (success) {
-                    logger.info("ファイルをダウンロードしました: {}", filePath);
+                    logger.info("サーバー {} のファイルをダウンロードしました: {}", serverId, filePath);
 
                     // WebSocket通知を送信
-                    notificationServer.notifyFileOperation("download", filePath, true);
+                    notificationServer.notifyFileOperation(serverId, "download", filePath, true);
 
                     // ファイル名を取得
                     Path path = Paths.get(filePath);
@@ -113,33 +124,39 @@ public class FtpDownloadHandler implements HttpHandler {
                 }
             }
         } catch (AppException e) {
-            logger.warn("FTPファイルダウンロードエラー: {}", e.getMessage());
+            logger.warn("サーバー {} のFTPファイルダウンロードエラー: {}", serverId, e.getMessage());
 
             // WebSocket通知を送信
-            notificationServer.notifyFileOperation("download", filePath, false);
+            notificationServer.notifyFileOperation(serverId, "download", filePath, false);
 
             Map<String, Object> errorData = new HashMap<>();
             errorData.put("success", false);
             errorData.put("error", "ダウンロードエラー");
             errorData.put("message", e.getMessage());
+            errorData.put("serverId", serverId);
 
             sendJsonResponse(exchange, e.getStatusCode(), errorData);
         } catch (Exception e) {
-            logger.error("FTPファイルダウンロード中に予期しないエラーが発生しました", e);
+            logger.error("サーバー {} のFTPファイルダウンロード中に予期しないエラーが発生しました", serverId, e);
 
             // WebSocket通知を送信
-            notificationServer.notifyFileOperation("download", filePath, false);
+            notificationServer.notifyFileOperation(serverId, "download", filePath, false);
 
             Map<String, Object> errorData = new HashMap<>();
             errorData.put("success", false);
             errorData.put("error", "サーバーエラー");
             errorData.put("message", e.getMessage());
+            errorData.put("serverId", serverId);
 
             sendJsonResponse(exchange, 500, errorData);
         } finally {
             // 一時ファイルを削除
             if (tempFile != null && tempFile.exists()) {
-                tempFile.delete();
+                boolean deleted = tempFile.delete();
+                if (!deleted) {
+                    logger.warn("一時ファイルの削除に失敗しました: {}", tempFile.getAbsolutePath());
+                    tempFile.deleteOnExit(); // JVM終了時に削除するようにマーク
+                }
             }
         }
     }
@@ -187,6 +204,7 @@ public class FtpDownloadHandler implements HttpHandler {
         errorData.put("success", false);
         errorData.put("error", "Bad Request");
         errorData.put("message", message);
+        errorData.put("serverId", serverId);
 
         sendJsonResponse(exchange, 400, errorData);
     }
@@ -202,6 +220,7 @@ public class FtpDownloadHandler implements HttpHandler {
         errorData.put("success", false);
         errorData.put("error", "Method Not Allowed");
         errorData.put("message", "GETメソッドのみが許可されています");
+        errorData.put("serverId", serverId);
 
         setCorsHeaders(exchange);
         sendJsonResponse(exchange, 405, errorData);

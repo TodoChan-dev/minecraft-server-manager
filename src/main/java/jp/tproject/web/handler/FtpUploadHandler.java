@@ -20,12 +20,14 @@ import java.util.regex.Pattern;
 
 /**
  * FTPファイルアップロードを処理するハンドラ
+ * 複数サーバー対応
  */
 public class FtpUploadHandler implements HttpHandler {
 
     private static final Logger logger = LoggerFactory.getLogger(FtpUploadHandler.class);
     private final FtpManager ftpManager;
     private final NotificationServer notificationServer;
+    private final String serverId;
 
     // multipart/form-dataの境界パターン
     private static final Pattern BOUNDARY_PATTERN = Pattern.compile("boundary=(.+)$");
@@ -38,10 +40,12 @@ public class FtpUploadHandler implements HttpHandler {
      *
      * @param ftpManager FTPマネージャー
      * @param notificationServer 通知サーバー
+     * @param serverId サーバーID
      */
-    public FtpUploadHandler(FtpManager ftpManager, NotificationServer notificationServer) {
+    public FtpUploadHandler(FtpManager ftpManager, NotificationServer notificationServer, String serverId) {
         this.ftpManager = ftpManager;
         this.notificationServer = notificationServer;
+        this.serverId = serverId;
     }
 
     @Override
@@ -119,16 +123,17 @@ public class FtpUploadHandler implements HttpHandler {
                 boolean success = ftpManager.uploadFile(directory, fileName, fis);
 
                 if (success) {
-                    logger.info("ファイルをアップロードしました: {}/{}", directory, fileName);
+                    logger.info("サーバー {} のファイルをアップロードしました: {}/{}", serverId, directory, fileName);
 
                     // WebSocket通知を送信
-                    notificationServer.notifyFileOperation("upload", directory + "/" + fileName, true);
+                    notificationServer.notifyFileOperation(serverId, "upload", directory + "/" + fileName, true);
 
                     // 成功レスポンスを送信
                     Map<String, Object> responseData = new HashMap<>();
                     responseData.put("success", true);
                     responseData.put("message", "ファイルをアップロードしました");
                     responseData.put("path", directory + "/" + fileName);
+                    responseData.put("serverId", serverId);
 
                     sendJsonResponse(exchange, 200, responseData);
                 } else {
@@ -136,31 +141,41 @@ public class FtpUploadHandler implements HttpHandler {
                 }
             }
         } catch (AppException e) {
-            logger.warn("FTPファイルアップロードエラー: {}", e.getMessage());
+            logger.warn("サーバー {} のFTPファイルアップロードエラー: {}", serverId, e.getMessage());
 
             // WebSocket通知を送信
-            notificationServer.notifyFileOperation("upload", directory + "/" +
-                    (exchange.getRequestHeaders().getFirst("X-Filename") != null ?
-                            exchange.getRequestHeaders().getFirst("X-Filename") : "unknown"), false);
+            String filename = exchange.getRequestHeaders().getFirst("X-Filename");
+            if (filename == null) {
+                filename = "unknown";
+            }
+
+            notificationServer.notifyFileOperation(serverId, "upload",
+                    directory + "/" + filename, false);
 
             Map<String, Object> errorData = new HashMap<>();
             errorData.put("success", false);
             errorData.put("error", "アップロードエラー");
             errorData.put("message", e.getMessage());
+            errorData.put("serverId", serverId);
 
             sendJsonResponse(exchange, e.getStatusCode(), errorData);
         } catch (Exception e) {
-            logger.error("FTPファイルアップロード中に予期しないエラーが発生しました", e);
+            logger.error("サーバー {} のFTPファイルアップロード中に予期しないエラーが発生しました", serverId, e);
 
             // WebSocket通知を送信
-            notificationServer.notifyFileOperation("upload", directory + "/" +
-                    (exchange.getRequestHeaders().getFirst("X-Filename") != null ?
-                            exchange.getRequestHeaders().getFirst("X-Filename") : "unknown"), false);
+            String filename = exchange.getRequestHeaders().getFirst("X-Filename");
+            if (filename == null) {
+                filename = "unknown";
+            }
+
+            notificationServer.notifyFileOperation(serverId, "upload",
+                    directory + "/" + filename, false);
 
             Map<String, Object> errorData = new HashMap<>();
             errorData.put("success", false);
             errorData.put("error", "サーバーエラー");
             errorData.put("message", e.getMessage());
+            errorData.put("serverId", serverId);
 
             sendJsonResponse(exchange, 500, errorData);
         } finally {
@@ -306,6 +321,7 @@ public class FtpUploadHandler implements HttpHandler {
         errorData.put("success", false);
         errorData.put("error", "Method Not Allowed");
         errorData.put("message", "POSTメソッドのみが許可されています");
+        errorData.put("serverId", serverId);
 
         setCorsHeaders(exchange);
         sendJsonResponse(exchange, 405, errorData);

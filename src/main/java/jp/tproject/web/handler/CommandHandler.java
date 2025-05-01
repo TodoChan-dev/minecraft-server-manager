@@ -2,6 +2,7 @@ package jp.tproject.web.handler;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import jp.tproject.config.ConfigManager;
 import jp.tproject.core.AppException;
 import jp.tproject.core.JsonUtil;
 import jp.tproject.minecraft.MinecraftServerManager;
@@ -19,6 +20,7 @@ import java.util.concurrent.CompletableFuture;
 
 /**
  * サーバーコマンド実行リクエストを処理するハンドラ
+ * 複数サーバー対応
  */
 public class CommandHandler implements HttpHandler {
 
@@ -62,14 +64,30 @@ public class CommandHandler implements HttpHandler {
             // JSONをパース
             Map<String, Object> requestData = JsonUtil.jsonToMap(requestBodyString);
 
-            // コマンドを取得
-            if (!requestData.containsKey("cmd") || !(requestData.get("cmd") instanceof String)) {
+            // コマンドとサーバーIDを取得
+            String command = null;
+            String serverId = null;
+
+            if (requestData.containsKey("cmd")) {
+                command = requestData.get("cmd").toString();
+            }
+
+            if (requestData.containsKey("serverId")) {
+                serverId = requestData.get("serverId").toString();
+            }
+
+            if (command == null || command.trim().isEmpty()) {
                 throw new AppException("リクエストには「cmd」フィールドが必要です", 400);
             }
 
-            String command = (String) requestData.get("cmd");
-            if (command == null || command.trim().isEmpty()) {
-                throw new AppException("コマンドが空です", 400);
+            // サーバーIDが指定されていない場合はデフォルトサーバーを使用
+            if (serverId == null || serverId.isEmpty()) {
+                serverId = ConfigManager.getInstance().getDefaultServerConfig().getId();
+            }
+
+            // サーバー設定を確認
+            if (ConfigManager.getInstance().getServerConfig(serverId) == null) {
+                throw new AppException("指定されたサーバーIDは存在しません: " + serverId, 404);
             }
 
             // サニタイズとチェック
@@ -77,18 +95,19 @@ public class CommandHandler implements HttpHandler {
 
             // コマンド実行のロジックを非同期で実行
             final String finalCommand = command;
+            final String finalServerId = serverId;
             CompletableFuture.runAsync(() -> {
                 try {
-                    logger.info("コマンドを実行します: {}", finalCommand);
+                    logger.info("サーバー {} でコマンドを実行します: {}", finalServerId, finalCommand);
 
                     // コマンド実行
-                    String output = executeCommand(finalCommand);
+                    String output = executeCommand(finalServerId, finalCommand);
 
-                    logger.info("コマンド実行が完了しました: {}", finalCommand);
-                    notificationServer.notifyCommandExecution(finalCommand, true, output);
+                    logger.info("サーバー {} のコマンド実行が完了しました: {}", finalServerId, finalCommand);
+                    notificationServer.notifyCommandExecution(finalServerId, finalCommand, true, output);
                 } catch (Exception e) {
-                    logger.error("コマンド実行中にエラーが発生しました: {}", finalCommand, e);
-                    notificationServer.notifyCommandExecution(finalCommand, false, e.getMessage());
+                    logger.error("サーバー {} のコマンド実行中にエラーが発生しました: {}", finalServerId, finalCommand, e);
+                    notificationServer.notifyCommandExecution(finalServerId, finalCommand, false, e.getMessage());
                 }
             });
 
@@ -97,6 +116,7 @@ public class CommandHandler implements HttpHandler {
             responseData.put("success", true);
             responseData.put("message", "コマンド実行リクエストを受け付けました");
             responseData.put("command", command);
+            responseData.put("serverId", serverId);
 
             sendJsonResponse(exchange, 200, responseData);
         } catch (AppException e) {
@@ -121,15 +141,23 @@ public class CommandHandler implements HttpHandler {
     }
 
     /**
-     * コマンドを実行して結果を返す
+     * 指定されたサーバーでコマンドを実行して結果を返す
      *
+     * @param serverId サーバーID
      * @param command 実行するコマンド
      * @return コマンド実行結果
      */
-    private String executeCommand(String command) {
+    private String executeCommand(String serverId, String command) {
         try {
+            // サーバーが実行中か確認
+            if (!serverManager.isServerRunning(serverId)) {
+                throw new AppException("サーバー " + serverId + " は実行していません", 400);
+            }
+
             // RCONを使用してMinecraftサーバーにコマンドを送信
-            return serverManager.executeCommand(command);
+            return serverManager.executeCommand(serverId, command);
+        } catch (AppException e) {
+            throw e;
         } catch (Exception e) {
             throw new AppException("コマンド実行中にエラーが発生しました: " + e.getMessage(), e);
         }

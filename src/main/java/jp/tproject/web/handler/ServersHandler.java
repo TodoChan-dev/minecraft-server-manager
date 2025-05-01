@@ -2,50 +2,27 @@ package jp.tproject.web.handler;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
-import jp.tproject.core.AppException;
+import jp.tproject.config.ConfigManager;
+import jp.tproject.config.ServerConfig;
 import jp.tproject.core.JsonUtil;
-import jp.tproject.ftp.FtpManager;
+import jp.tproject.minecraft.MinecraftServerManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.OutputStream;
-import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * FTPファイル一覧を取得するハンドラ
- * 複数サーバー対応
+ * サーバー一覧と情報を提供するハンドラー
  */
-public class FtpListHandler implements HttpHandler {
+public class ServersHandler implements HttpHandler {
 
-    private static final Logger logger = LoggerFactory.getLogger(FtpListHandler.class);
-    private final FtpManager ftpManager;
-    private final String serverId;
-
-    /**
-     * FtpListHandlerのインスタンスを作成
-     *
-     * @param ftpManager FTPマネージャー
-     * @param serverId サーバーID
-     */
-    public FtpListHandler(FtpManager ftpManager, String serverId) {
-        this.ftpManager = ftpManager;
-        this.serverId = serverId;
-    }
-
-    /**
-     * 後方互換性のためのコンストラクタ
-     *
-     * @param ftpManager FTPマネージャー
-     */
-    public FtpListHandler(FtpManager ftpManager) {
-        this.ftpManager = ftpManager;
-        this.serverId = "default";
-    }
+    private static final Logger logger = LoggerFactory.getLogger(ServersHandler.class);
 
     @Override
     public void handle(HttpExchange exchange) throws IOException {
@@ -65,53 +42,78 @@ public class FtpListHandler implements HttpHandler {
         }
 
         try {
-            // クエリパラメータからディレクトリパスを取得
-            String query = exchange.getRequestURI().getQuery();
-            String directory = null;
-
-            if (query != null && !query.isEmpty()) {
-                String[] params = query.split("&");
-                for (String param : params) {
-                    String[] keyValue = param.split("=");
-                    if (keyValue.length == 2 && keyValue[0].equals("path")) {
-                        directory = URLDecoder.decode(keyValue[1], StandardCharsets.UTF_8);
-                        break;
-                    }
-                }
-            }
-
-            // FTPファイル一覧を取得
-            List<Map<String, Object>> files = ftpManager.listFiles(directory);
+            // 全サーバー情報を取得
+            List<Map<String, Object>> serversInfo = getServersInfo();
 
             // レスポンスデータを作成
             Map<String, Object> responseData = new HashMap<>();
             responseData.put("success", true);
-            responseData.put("directory", directory != null ? directory : "/");
-            responseData.put("files", files);
-            responseData.put("serverId", serverId);
+            responseData.put("servers", serversInfo);
+
+            // デフォルトサーバーIDも含める
+            String defaultServerId = ConfigManager.getInstance().getDefaultServerConfig().getId();
+            responseData.put("defaultServerId", defaultServerId);
 
             sendJsonResponse(exchange, 200, responseData);
-        } catch (AppException e) {
-            logger.warn("サーバー {} のFTPファイル一覧の取得に失敗しました: {}", serverId, e.getMessage());
-
-            Map<String, Object> errorData = new HashMap<>();
-            errorData.put("success", false);
-            errorData.put("error", "FTPエラー");
-            errorData.put("message", e.getMessage());
-            errorData.put("serverId", serverId);
-
-            sendJsonResponse(exchange, e.getStatusCode(), errorData);
         } catch (Exception e) {
-            logger.error("サーバー {} のFTPファイル一覧の取得中にエラーが発生しました", serverId, e);
+            logger.error("サーバー情報の取得中にエラーが発生しました", e);
 
             Map<String, Object> errorData = new HashMap<>();
             errorData.put("success", false);
             errorData.put("error", "サーバーエラー");
             errorData.put("message", e.getMessage());
-            errorData.put("serverId", serverId);
 
             sendJsonResponse(exchange, 500, errorData);
         }
+    }
+
+    /**
+     * すべてのサーバー情報を取得
+     *
+     * @return サーバー情報のリスト
+     */
+    private List<Map<String, Object>> getServersInfo() {
+        List<Map<String, Object>> result = new ArrayList<>();
+
+        ConfigManager configManager = ConfigManager.getInstance();
+        MinecraftServerManager serverManager = MinecraftServerManager.getInstance();
+
+        // 現在のサーバー状態を更新
+        Map<String, String> allServerStatus = serverManager.getAllServerStatus();
+
+        // すべてのサーバー設定を取得してレスポンス用データに変換
+        for (ServerConfig config : configManager.getAllServerConfigs().values()) {
+            Map<String, Object> serverInfo = new HashMap<>();
+
+            String serverId = config.getId();
+
+            serverInfo.put("id", serverId);
+            serverInfo.put("name", config.getName());
+            serverInfo.put("rconHost", config.getRconHost());
+            serverInfo.put("rconPort", config.getRconPort());
+            // パスワードは送信しない
+            serverInfo.put("status", allServerStatus.getOrDefault(serverId, "unknown"));
+            serverInfo.put("pluginsDirectory", config.getPluginsDirectory());
+
+            // 追加パラメータがあれば含める（機密情報を除く）
+            Map<String, String> extraParams = new HashMap<>();
+            for (Map.Entry<String, String> entry : config.getExtraParams().entrySet()) {
+                String key = entry.getKey();
+                if (!key.toLowerCase().contains("password") &&
+                        !key.toLowerCase().contains("secret") &&
+                        !key.toLowerCase().contains("token")) {
+                    extraParams.put(key, entry.getValue());
+                }
+            }
+
+            if (!extraParams.isEmpty()) {
+                serverInfo.put("extraParams", extraParams);
+            }
+
+            result.add(serverInfo);
+        }
+
+        return result;
     }
 
     /**
@@ -156,7 +158,6 @@ public class FtpListHandler implements HttpHandler {
         errorData.put("success", false);
         errorData.put("error", "Method Not Allowed");
         errorData.put("message", "GETメソッドのみが許可されています");
-        errorData.put("serverId", serverId);
 
         setCorsHeaders(exchange);
         sendJsonResponse(exchange, 405, errorData);

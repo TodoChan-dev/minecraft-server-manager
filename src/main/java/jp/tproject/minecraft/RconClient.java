@@ -50,7 +50,7 @@ public class RconClient implements Closeable {
      * @throws IOException 接続や認証に失敗した場合
      */
     public boolean connect() throws IOException {
-        if (socket != null && socket.isConnected()) {
+        if (socket != null && socket.isConnected() && !socket.isClosed()) {
             return authenticated;
         }
 
@@ -80,6 +80,15 @@ public class RconClient implements Closeable {
             close();
             throw e;
         }
+    }
+
+    /**
+     * クライアントが接続されているかどうかを確認
+     *
+     * @return 接続されていてかつ認証済みの場合true
+     */
+    public boolean isConnected() {
+        return socket != null && socket.isConnected() && !socket.isClosed() && authenticated;
     }
 
     /**
@@ -126,6 +135,7 @@ public class RconClient implements Closeable {
         } catch (IOException e) {
             logger.error("RCONコマンド実行エラー: {}", e.getMessage());
             // 接続エラーの場合は接続を閉じて再接続を試みる
+            authenticated = false;
             close();
             throw e;
         }
@@ -219,6 +229,7 @@ public class RconClient implements Closeable {
      * インスタンスがガベージコレクションされる前に接続を閉じる
      */
     @Override
+    @SuppressWarnings("removal")
     protected void finalize() throws Throwable {
         try {
             close();

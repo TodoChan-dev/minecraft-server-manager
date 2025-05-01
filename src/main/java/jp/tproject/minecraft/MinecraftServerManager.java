@@ -1,5 +1,7 @@
 package jp.tproject.minecraft;
 
+import jp.tproject.config.ConfigManager;
+import jp.tproject.config.ServerConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -8,111 +10,170 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Minecraftサーバーの操作を管理するクラス
+ * 複数サーバーに対応
  */
 public class MinecraftServerManager {
     private static final Logger logger = LoggerFactory.getLogger(MinecraftServerManager.class);
 
-    private final String rconHost;
-    private final int rconPort;
-    private final String rconPassword;
+    // シングルトンインスタンス
+    private static MinecraftServerManager instance;
 
-    private final String serverStartCommand;
-    private final String serverStopCommand;
-    private final String serverRestartCommand;
+    // RCONクライアントキャッシュ (サーバーID -> RconClient)
+    private final Map<String, RconClient> rconClients = new ConcurrentHashMap<>();
+
+    // サーバー状態キャッシュ (サーバーID -> 状態)
+    private final Map<String, String> serverStatus = new ConcurrentHashMap<>();
 
     /**
-     * MinecraftServerManagerを初期化
-     *
-     * @param rconHost RCONホスト
-     * @param rconPort RCONポート
-     * @param rconPassword RCONパスワード
-     * @param serverStartCommand サーバー起動コマンド
-     * @param serverStopCommand サーバー停止コマンド
-     * @param serverRestartCommand サーバー再起動コマンド
+     * プライベートコンストラクタ
      */
-    public MinecraftServerManager(String rconHost, int rconPort, String rconPassword,
-                                  String serverStartCommand, String serverStopCommand, String serverRestartCommand) {
-        this.rconHost = rconHost;
-        this.rconPort = rconPort;
-        this.rconPassword = rconPassword;
-        this.serverStartCommand = serverStartCommand;
-        this.serverStopCommand = serverStopCommand;
-        this.serverRestartCommand = serverRestartCommand;
+    private MinecraftServerManager() {
+        // 初期化処理
+        initServerStatus();
     }
 
     /**
-     * 環境変数からMinecraftServerManagerを作成
+     * シングルトンインスタンスを取得
      *
-     * @return MinecraftServerManagerのインスタンス
+     * @return MinecraftServerManagerインスタンス
      */
-    public static MinecraftServerManager fromEnvironment() {
-        String rconHost = System.getenv("MINECRAFT_RCON_HOST") != null
-                ? System.getenv("MINECRAFT_RCON_HOST") : "localhost";
+    public static synchronized MinecraftServerManager getInstance() {
+        if (instance == null) {
+            instance = new MinecraftServerManager();
+        }
+        return instance;
+    }
 
-        int rconPort = System.getenv("MINECRAFT_RCON_PORT") != null
-                ? Integer.parseInt(System.getenv("MINECRAFT_RCON_PORT")) : 25575;
+    /**
+     * サーバー状態の初期化
+     */
+    private void initServerStatus() {
+        ConfigManager configManager = ConfigManager.getInstance();
 
-        String rconPassword = System.getenv("MINECRAFT_RCON_PASSWORD") != null
-                ? System.getenv("MINECRAFT_RCON_PASSWORD") : "";
+        // すべてのサーバー設定を取得
+        Map<String, ServerConfig> allServers = configManager.getAllServerConfigs();
 
-        String serverStartCmd = System.getenv("MINECRAFT_START_COMMAND") != null
-                ? System.getenv("MINECRAFT_START_COMMAND") : "systemctl start minecraft";
+        // サーバー状態を初期化
+        for (String serverId : allServers.keySet()) {
+            // サーバー状態を確認して設定
+            boolean isRunning = isServerRunning(serverId);
+            serverStatus.put(serverId, isRunning ? "running" : "stopped");
 
-        String serverStopCmd = System.getenv("MINECRAFT_STOP_COMMAND") != null
-                ? System.getenv("MINECRAFT_STOP_COMMAND") : "systemctl stop minecraft";
+            logger.info("サーバー状態を初期化しました: {} - {}", serverId, isRunning ? "実行中" : "停止中");
+        }
+    }
 
-        String serverRestartCmd = System.getenv("MINECRAFT_RESTART_COMMAND") != null
-                ? System.getenv("MINECRAFT_RESTART_COMMAND") : "systemctl restart minecraft";
+    /**
+     * 指定されたサーバーIDのRCONクライアントを取得
+     *
+     * @param serverId サーバーID
+     * @return RconClientインスタンス
+     * @throws IOException 接続エラーが発生した場合
+     */
+    private synchronized RconClient getRconClient(String serverId) throws IOException {
+        // キャッシュされたクライアントがあれば返却
+        if (rconClients.containsKey(serverId)) {
+            RconClient client = rconClients.get(serverId);
 
-        return new MinecraftServerManager(
-                rconHost, rconPort, rconPassword,
-                serverStartCmd, serverStopCmd, serverRestartCmd
+            // 接続状態をチェック
+            if (client.isConnected()) {
+                return client;
+            } else {
+                // 切断されていれば削除
+                rconClients.remove(serverId);
+            }
+        }
+
+        // サーバー設定を取得
+        ServerConfig config = ConfigManager.getInstance().getServerConfig(serverId);
+        if (config == null) {
+            throw new IOException("サーバー設定が見つかりません: " + serverId);
+        }
+
+        // 新しいRCONクライアントを作成
+        RconClient client = new RconClient(
+                config.getRconHost(),
+                config.getRconPort(),
+                config.getRconPassword()
         );
+
+        // 接続して認証
+        if (client.connect()) {
+            // 成功したらキャッシュに追加
+            rconClients.put(serverId, client);
+            return client;
+        } else {
+            throw new IOException("RCONサーバーに接続できませんでした: " + serverId);
+        }
     }
 
     /**
-     * サーバーにコマンドを実行
+     * 特定のサーバーにコマンドを実行
      *
+     * @param serverId サーバーID
      * @param command 実行するコマンド
      * @return コマンド実行結果
      * @throws IOException 通信エラーが発生した場合
      */
-    public String executeCommand(String command) throws IOException {
-        try (RconClient rcon = new RconClient(rconHost, rconPort, rconPassword)) {
-            if (!rcon.connect()) {
-                throw new IOException("RCONサーバーに接続できませんでした");
-            }
-
-            logger.info("コマンドを実行します: {}", command);
-            return rcon.executeCommand(command);
+    public String executeCommand(String serverId, String command) throws IOException {
+        try {
+            RconClient client = getRconClient(serverId);
+            logger.info("サーバー {} にコマンドを実行します: {}", serverId, command);
+            return client.executeCommand(command);
+        } catch (IOException e) {
+            logger.error("サーバー {} のコマンド実行中にエラーが発生しました: {}", serverId, e.getMessage());
+            throw e;
         }
     }
 
     /**
      * サーバーを起動
      *
+     * @param serverId サーバーID
      * @return 成功時true
      */
-    public boolean startServer() {
+    public boolean startServer(String serverId) {
         try {
-            logger.info("サーバーを起動しています");
-            Process process = executeSystemCommand(serverStartCommand);
+            // サーバー設定を取得
+            ServerConfig config = ConfigManager.getInstance().getServerConfig(serverId);
+            if (config == null) {
+                logger.error("サーバー設定が見つかりません: {}", serverId);
+                return false;
+            }
+
+            // サーバーが既に動作中かチェック
+            if (isServerRunning(serverId)) {
+                logger.info("サーバー {} は既に実行中です", serverId);
+                return true;
+            }
+
+            logger.info("サーバー {} を起動しています", serverId);
+            serverStatus.put(serverId, "starting");
+
+            // 起動コマンドを実行
+            Process process = executeSystemCommand(config.getServerStartCommand());
             int exitCode = process.waitFor();
 
             if (exitCode == 0) {
-                logger.info("サーバー起動コマンドを正常に実行しました");
+                logger.info("サーバー {} の起動コマンドを正常に実行しました", serverId);
+                serverStatus.put(serverId, "running");
                 return true;
             } else {
-                logger.error("サーバー起動コマンドが失敗しました。終了コード: {}", exitCode);
+                logger.error("サーバー {} の起動コマンドが失敗しました。終了コード: {}", serverId, exitCode);
+                serverStatus.put(serverId, "error");
                 return false;
             }
         } catch (Exception e) {
-            logger.error("サーバー起動中にエラーが発生しました", e);
+            logger.error("サーバー {} の起動中にエラーが発生しました", serverId, e);
+            serverStatus.put(serverId, "error");
             return false;
         }
     }
@@ -120,46 +181,74 @@ public class MinecraftServerManager {
     /**
      * サーバーを停止
      *
+     * @param serverId サーバーID
      * @return 成功時true
      */
-    public boolean stopServer() {
+    public boolean stopServer(String serverId) {
         try {
+            // サーバー設定を取得
+            ServerConfig config = ConfigManager.getInstance().getServerConfig(serverId);
+            if (config == null) {
+                logger.error("サーバー設定が見つかりません: {}", serverId);
+                return false;
+            }
+
+            // サーバーが動作中でなければそのまま成功
+            if (!isServerRunning(serverId)) {
+                logger.info("サーバー {} は既に停止しています", serverId);
+                return true;
+            }
+
+            serverStatus.put(serverId, "stopping");
+
             // まず、RCONでsaveコマンドを実行
             try {
-                executeCommand("save-all");
-                logger.info("ワールドの保存を実行しました");
+                executeCommand(serverId, "save-all");
+                logger.info("サーバー {} のワールドの保存を実行しました", serverId);
                 // 少し待機してセーブが完了するのを待つ
                 Thread.sleep(2000);
             } catch (Exception e) {
-                logger.warn("ワールドの保存中にエラーが発生しました", e);
+                logger.warn("サーバー {} のワールドの保存中にエラーが発生しました", serverId, e);
                 // 続行（サーバーがすでに停止している可能性がある）
             }
 
             // 次に、RCONでstopコマンドを試す（失敗してもOK）
             try {
-                executeCommand("stop");
-                logger.info("サーバー停止コマンドをゲーム内で実行しました");
+                executeCommand(serverId, "stop");
+                logger.info("サーバー {} の停止コマンドをゲーム内で実行しました", serverId);
                 // サーバーが停止するまで少し待機
                 Thread.sleep(5000);
             } catch (Exception e) {
-                logger.warn("ゲーム内停止コマンドの実行中にエラーが発生しました", e);
+                logger.warn("サーバー {} のゲーム内停止コマンドの実行中にエラーが発生しました", serverId, e);
                 // 続行（システムコマンドでの停止にフォールバック）
             }
 
             // システムコマンドでの停止
-            logger.info("サーバーを停止しています");
-            Process process = executeSystemCommand(serverStopCommand);
+            logger.info("サーバー {} を停止しています", serverId);
+            Process process = executeSystemCommand(config.getServerStopCommand());
             int exitCode = process.waitFor();
 
             if (exitCode == 0) {
-                logger.info("サーバー停止コマンドを正常に実行しました");
+                logger.info("サーバー {} の停止コマンドを正常に実行しました", serverId);
+                serverStatus.put(serverId, "stopped");
+
+                // RCONクライアントを削除
+                synchronized (this) {
+                    if (rconClients.containsKey(serverId)) {
+                        rconClients.get(serverId).close();
+                        rconClients.remove(serverId);
+                    }
+                }
+
                 return true;
             } else {
-                logger.error("サーバー停止コマンドが失敗しました。終了コード: {}", exitCode);
+                logger.error("サーバー {} の停止コマンドが失敗しました。終了コード: {}", serverId, exitCode);
+                serverStatus.put(serverId, "error");
                 return false;
             }
         } catch (Exception e) {
-            logger.error("サーバー停止中にエラーが発生しました", e);
+            logger.error("サーバー {} の停止中にエラーが発生しました", serverId, e);
+            serverStatus.put(serverId, "error");
             return false;
         }
     }
@@ -167,37 +256,154 @@ public class MinecraftServerManager {
     /**
      * サーバーを再起動
      *
+     * @param serverId サーバーID
      * @return 成功時true
      */
-    public boolean restartServer() {
+    public boolean restartServer(String serverId) {
         try {
-            // まず、RCONでsaveコマンドを実行
-            try {
-                executeCommand("save-all");
-                logger.info("ワールドの保存を実行しました");
-                // 少し待機してセーブが完了するのを待つ
-                Thread.sleep(2000);
-            } catch (Exception e) {
-                logger.warn("ワールドの保存中にエラーが発生しました", e);
-                // 続行（サーバーがすでに停止している可能性がある）
+            // サーバー設定を取得
+            ServerConfig config = ConfigManager.getInstance().getServerConfig(serverId);
+            if (config == null) {
+                logger.error("サーバー設定が見つかりません: {}", serverId);
+                return false;
+            }
+
+            serverStatus.put(serverId, "restarting");
+
+            // まず、RCONでsaveコマンドを実行（サーバーが動作中の場合のみ）
+            if (isServerRunning(serverId)) {
+                try {
+                    executeCommand(serverId, "save-all");
+                    logger.info("サーバー {} のワールドの保存を実行しました", serverId);
+                    // 少し待機してセーブが完了するのを待つ
+                    Thread.sleep(2000);
+                } catch (Exception e) {
+                    logger.warn("サーバー {} のワールドの保存中にエラーが発生しました", serverId, e);
+                    // 続行
+                }
             }
 
             // システムコマンドでの再起動
-            logger.info("サーバーを再起動しています");
-            Process process = executeSystemCommand(serverRestartCommand);
+            logger.info("サーバー {} を再起動しています", serverId);
+            Process process = executeSystemCommand(config.getServerRestartCommand());
             int exitCode = process.waitFor();
 
             if (exitCode == 0) {
-                logger.info("サーバー再起動コマンドを正常に実行しました");
+                logger.info("サーバー {} の再起動コマンドを正常に実行しました", serverId);
+                serverStatus.put(serverId, "starting");
+
+                // 古いRCONクライアントを削除
+                synchronized (this) {
+                    if (rconClients.containsKey(serverId)) {
+                        rconClients.get(serverId).close();
+                        rconClients.remove(serverId);
+                    }
+                }
+
+                // 起動完了まで少し待機
+                Thread.sleep(5000);
+
+                // 起動したことを確認
+                if (isServerRunning(serverId)) {
+                    serverStatus.put(serverId, "running");
+                } else {
+                    // 少し待ってもう一度確認
+                    Thread.sleep(5000);
+                    if (isServerRunning(serverId)) {
+                        serverStatus.put(serverId, "running");
+                    } else {
+                        logger.warn("サーバー {} の再起動後、実行状態を確認できませんでした", serverId);
+                        serverStatus.put(serverId, "unknown");
+                    }
+                }
+
                 return true;
             } else {
-                logger.error("サーバー再起動コマンドが失敗しました。終了コード: {}", exitCode);
+                logger.error("サーバー {} の再起動コマンドが失敗しました。終了コード: {}", serverId, exitCode);
+                serverStatus.put(serverId, "error");
                 return false;
             }
         } catch (Exception e) {
-            logger.error("サーバー再起動中にエラーが発生しました", e);
+            logger.error("サーバー {} の再起動中にエラーが発生しました", serverId, e);
+            serverStatus.put(serverId, "error");
             return false;
         }
+    }
+
+    /**
+     * すべてのサーバーを起動
+     *
+     * @return 成功したサーバーID一覧
+     */
+    public List<String> startAllServers() {
+        List<String> successServers = new ArrayList<>();
+        ConfigManager configManager = ConfigManager.getInstance();
+
+        for (ServerConfig config : configManager.getAllServerConfigs().values()) {
+            String serverId = config.getId();
+            if (startServer(serverId)) {
+                successServers.add(serverId);
+            }
+        }
+
+        return successServers;
+    }
+
+    /**
+     * すべてのサーバーを停止
+     *
+     * @return 成功したサーバーID一覧
+     */
+    public List<String> stopAllServers() {
+        List<String> successServers = new ArrayList<>();
+        ConfigManager configManager = ConfigManager.getInstance();
+
+        for (ServerConfig config : configManager.getAllServerConfigs().values()) {
+            String serverId = config.getId();
+            if (stopServer(serverId)) {
+                successServers.add(serverId);
+            }
+        }
+
+        return successServers;
+    }
+
+    /**
+     * すべてのサーバーを再起動
+     *
+     * @return 成功したサーバーID一覧
+     */
+    public List<String> restartAllServers() {
+        List<String> successServers = new ArrayList<>();
+        ConfigManager configManager = ConfigManager.getInstance();
+
+        for (ServerConfig config : configManager.getAllServerConfigs().values()) {
+            String serverId = config.getId();
+            if (restartServer(serverId)) {
+                successServers.add(serverId);
+            }
+        }
+
+        return successServers;
+    }
+
+    /**
+     * 指定されたサーバーの状態を取得
+     *
+     * @param serverId サーバーID
+     * @return サーバー状態（running, stopped, starting, stopping, restarting, error, unknown）
+     */
+    public String getServerStatus(String serverId) {
+        return serverStatus.getOrDefault(serverId, "unknown");
+    }
+
+    /**
+     * すべてのサーバー状態を取得
+     *
+     * @return サーバーID -> 状態のマップ
+     */
+    public Map<String, String> getAllServerStatus() {
+        return new HashMap<>(serverStatus);
     }
 
     /**
@@ -256,28 +462,38 @@ public class MinecraftServerManager {
     /**
      * プラグインの有効/無効を切り替え
      *
+     * @param serverId サーバーID
      * @param pluginName プラグイン名
      * @param enable 有効化する場合true、無効化する場合false
      * @return 成功時true
      */
-    public boolean togglePlugin(String pluginName, boolean enable) {
+    public boolean togglePlugin(String serverId, String pluginName, boolean enable) {
         try {
+            // サーバーが実行中か確認
+            if (!isServerRunning(serverId)) {
+                logger.warn("プラグイン操作失敗: サーバー {} は実行中ではありません", serverId);
+                return false;
+            }
+
             // プラグインコマンドを実行
             String command = enable ? "plugin enable " + pluginName : "plugin disable " + pluginName;
-            String result = executeCommand(command);
+            String result = executeCommand(serverId, command);
 
             // 成功したかどうかを結果から判断
             boolean success = !result.toLowerCase().contains("error") && !result.toLowerCase().contains("unknown");
 
             if (success) {
-                logger.info("プラグイン{}を{}しました: {}", pluginName, enable ? "有効化" : "無効化", result);
+                logger.info("サーバー {} のプラグイン {} を {} しました: {}",
+                        serverId, pluginName, enable ? "有効化" : "無効化", result);
             } else {
-                logger.warn("プラグイン{}の{}に失敗しました: {}", pluginName, enable ? "有効化" : "無効化", result);
+                logger.warn("サーバー {} のプラグイン {} の {} に失敗しました: {}",
+                        serverId, pluginName, enable ? "有効化" : "無効化", result);
             }
 
             return success;
         } catch (Exception e) {
-            logger.error("プラグイン{}の{}中にエラーが発生しました", pluginName, enable ? "有効化" : "無効化", e);
+            logger.error("サーバー {} のプラグイン {} の {} 中にエラーが発生しました",
+                    serverId, pluginName, enable ? "有効化" : "無効化", e);
             return false;
         }
     }
@@ -285,14 +501,62 @@ public class MinecraftServerManager {
     /**
      * サーバーが現在動作しているかを確認
      *
+     * @param serverId サーバーID
      * @return サーバーが動作している場合true
      */
-    public boolean isServerRunning() {
-        try (RconClient rcon = new RconClient(rconHost, rconPort, rconPassword)) {
-            return rcon.connect();
-        } catch (Exception e) {
-            logger.debug("サーバーが動作していないようです: {}", e.getMessage());
+    public boolean isServerRunning(String serverId) {
+        // サーバー設定を取得
+        ServerConfig config = ConfigManager.getInstance().getServerConfig(serverId);
+        if (config == null) {
+            logger.error("サーバー設定が見つかりません: {}", serverId);
             return false;
+        }
+
+        try (RconClient rcon = new RconClient(config.getRconHost(), config.getRconPort(), config.getRconPassword())) {
+            boolean connected = rcon.connect();
+
+            // 接続が成功した場合、サーバーは実行中
+            if (connected) {
+                serverStatus.put(serverId, "running");
+            } else {
+                serverStatus.put(serverId, "stopped");
+            }
+
+            return connected;
+        } catch (Exception e) {
+            logger.debug("サーバー {} が動作していないようです: {}", serverId, e.getMessage());
+            serverStatus.put(serverId, "stopped");
+            return false;
+        }
+    }
+
+    /**
+     * 指定されたサーバーのプラグインディレクトリパスを取得
+     *
+     * @param serverId サーバーID
+     * @return プラグインディレクトリパス
+     */
+    public String getPluginsDirectory(String serverId) {
+        ServerConfig config = ConfigManager.getInstance().getServerConfig(serverId);
+        if (config == null) {
+            return "./plugins"; // デフォルト値
+        }
+        return config.getPluginsDirectory();
+    }
+
+    /**
+     * 全てのRCON接続を閉じる
+     */
+    public void closeAllConnections() {
+        synchronized (this) {
+            for (RconClient client : rconClients.values()) {
+                try {
+                    client.close();
+                } catch (Exception e) {
+                    logger.warn("RCON接続のクローズに失敗しました", e);
+                }
+            }
+            rconClients.clear();
         }
     }
 }
